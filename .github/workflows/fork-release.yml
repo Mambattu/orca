@@ -108,6 +108,7 @@ jobs:
     env:
       ORCA_BACKGROUND_LAUNCH: '1'
       ORCA_REQUIRE_ORCAD_TEMPLATE: '1'
+      ORCA_TERMINAL_HOST_BOOT_TIMEOUT_MS: '180000'
       NODE_OPTIONS: --max-old-space-size=6144
     steps:
       - uses: actions/checkout@v6
