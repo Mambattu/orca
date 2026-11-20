@@ -18,11 +18,9 @@ export const RELEASE_CHANNEL_LABELS: Readonly<Record<ReleaseChannel, string>> = 
   adhoc: 'Adhoc'
 }
 
-/** Keep dev tags out of the 10-entry main releases feed, where hourlies would evict stable/RC updates. */
-export const HOURLY_RELEASE_REPO = 'stablyai/orca-hourly'
-export const DAILY_RELEASE_REPO = 'stablyai/orca-daily'
-export const ADHOC_RELEASE_REPO = 'stablyai/orca-adhoc'
 export const MAIN_RELEASE_REPO = 'stablyai/orca'
+/** Fork builds update only from the fork's own releases; MAIN_RELEASE_REPO still serves upstream data feeds. */
+export const APP_UPDATE_REPO = 'Mambattu/orca'
 
 /** The dev channels, each published to its own repo rather than the main one. */
 const DEDICATED_REPO_CHANNELS = ['hourly', 'daily', 'adhoc'] as const
@@ -30,11 +28,11 @@ const DEDICATED_REPO_CHANNELS = ['hourly', 'daily', 'adhoc'] as const
 export type DedicatedRepoChannel = (typeof DEDICATED_REPO_CHANNELS)[number]
 
 const CHANNEL_RELEASE_REPOS: Record<ReleaseChannel, string> = {
-  stable: MAIN_RELEASE_REPO,
-  rc: MAIN_RELEASE_REPO,
-  hourly: HOURLY_RELEASE_REPO,
-  daily: DAILY_RELEASE_REPO,
-  adhoc: ADHOC_RELEASE_REPO
+  stable: APP_UPDATE_REPO,
+  rc: APP_UPDATE_REPO,
+  hourly: APP_UPDATE_REPO,
+  daily: APP_UPDATE_REPO,
+  adhoc: APP_UPDATE_REPO
 }
 
 export function isReleaseChannel(value: unknown): value is ReleaseChannel {
