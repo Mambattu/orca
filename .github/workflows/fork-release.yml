@@ -109,6 +109,9 @@ jobs:
       ORCA_BACKGROUND_LAUNCH: '1'
       ORCA_REQUIRE_ORCAD_TEMPLATE: '1'
       ORCA_TERMINAL_HOST_BOOT_TIMEOUT_MS: '180000'
+      ORCA_MAC_TEAM_ID: XTED42S9SG
+      # Pin the org identity; the team also holds an older Developer ID cert under a personal name.
+      CSC_NAME: 'Developer ID Application: Mambattu LLC (XTED42S9SG)'
       NODE_OPTIONS: --max-old-space-size=6144
     steps:
       - uses: actions/checkout@v6
