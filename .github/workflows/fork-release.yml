@@ -75,7 +75,7 @@ jobs:
           fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
             --prerelease="$PRERELEASE" --title "$TAG" \
-            --notes "Fork build of [stablyai/orca ${TAG}](https://github.com/stablyai/orca/releases/tag/${TAG}) with patches from \`release\`."
+            --notes "Fork build of [stablyai/orca ${TAG}](https://github.com/stablyai/orca/releases/tag/${TAG}) with patches from \`release\`. Report problems at https://github.com/Mambattu/orca/issues (not upstream)."
 
   # MARK: Server template
   orcad-template:
