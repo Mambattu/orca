@@ -1,0 +1,120 @@
+name: Fork Sync
+
+# Rebase release onto each new upstream stable tag and cut the matching fork release.
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Mambattu/orca'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BRANCH: release
+    steps:
+      # Upstream workflows assume stablyai runners and secrets; only fork-* may run here.
+      - name: Disable upstream workflows
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" --paginate \
+            -q '.workflows[] | select(.state == "active") | select(.path | test("^\\.github/workflows/fork-") | not) | .path' |
+          while read -r path; do
+            echo "Disabling $path"
+            gh workflow disable "$(basename "$path")" --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Resolve tags
+        id: tags
+        run: |
+          set -euo pipefail
+          new="$(gh release view --repo stablyai/orca --json tagName -q .tagName)"
+          old="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)"
+          if [[ -z "$old" ]]; then
+            echo "::error::No published fork release yet; cut the first one by hand."; exit 1
+          fi
+          if [[ "$new" == "$old" ]] || gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$new" >/dev/null 2>&1; then
+            echo "Up to date with $new."
+            echo "skip=true" >>"$GITHUB_OUTPUT"; exit 0
+          fi
+          { echo "new=$new"; echo "old=$old"; echo "skip=false"; } >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        if: steps.tags.outputs.skip == 'false'
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          filter: blob:none
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Rebase onto upstream ${{ steps.tags.outputs.new }}
+        id: rebase
+        if: steps.tags.outputs.skip == 'false'
+        env:
+          NEW: ${{ steps.tags.outputs.new }}
+          OLD: ${{ steps.tags.outputs.old }}
+        run: |
+          set -euo pipefail
+          git config user.name "Mambattu"
+          git config user.email "mambattu@protonmail.com"
+          git fetch --no-tags --filter=blob:none https://github.com/stablyai/orca.git \
+            "refs/tags/$NEW:refs/upstream/$NEW" "refs/tags/$OLD:refs/upstream/$OLD"
+          before="$(git rev-parse HEAD)"
+          echo "before=$before" >>"$GITHUB_OUTPUT"
+          git log --format='%h %s' "refs/upstream/$OLD..HEAD" > carry-before.txt
+          # Ported patches that upstream has since shipped become empty and are dropped.
+          if ! git rebase --empty=drop --onto "refs/upstream/$NEW" "refs/upstream/$OLD" "$BRANCH" > rebase.log 2>&1; then
+            git diff --name-only --diff-filter=U > conflicts.txt || true
+            git rebase --abort
+            echo "conflict=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git log --format='%h %s' "refs/upstream/$NEW..HEAD" > carry-after.txt
+          version="$(node -p "require('./package.json').version")"
+          [[ "v$version" == "$NEW" ]] || { echo "::error::package.json $version does not match $NEW"; exit 1; }
+          echo "conflict=false" >>"$GITHUB_OUTPUT"
+
+      - name: Open an issue on conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        env:
+          NEW: ${{ steps.tags.outputs.new }}
+          OLD: ${{ steps.tags.outputs.old }}
+        run: |
+          set -euo pipefail
+          title="Sync to upstream $NEW needs a manual rebase"
+          if gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number -q '.[0].number' | grep -q .; then
+            exit 1
+          fi
+          {
+            echo "Rebasing \`$BRANCH\` from upstream \`$OLD\` onto \`$NEW\` conflicted. Releases are paused at \`$OLD\`."
+            echo; echo "Conflicting files:"; echo '```'; cat conflicts.txt; echo '```'
+            echo; echo "Fork commits being carried:"; echo '```'; cat carry-before.txt; echo '```'
+            echo; echo "If a ported patch has since landed upstream in a changed form, drop it during the rebase."
+          } > body.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
+          exit 1
+
+      - name: Push branch and tag
+        if: steps.rebase.outputs.conflict == 'false'
+        env:
+          NEW: ${{ steps.tags.outputs.new }}
+          BEFORE: ${{ steps.rebase.outputs.before }}
+        run: |
+          set -euo pipefail
+          echo "Carried onto $NEW:"; cat carry-after.txt
+          git tag -a "$NEW" -m "$NEW"
+          git push --force-with-lease="$BRANCH:$BEFORE" origin "HEAD:refs/heads/$BRANCH"
+          git push origin "refs/tags/$NEW"
