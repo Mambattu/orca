@@ -58,7 +58,7 @@ jobs:
           ref: ${{ env.BRANCH }}
           fetch-depth: 0
           filter: blob:none
-          token: ${{ secrets.SYNC_TOKEN }}
+          ssh-key: ${{ secrets.SYNC_DEPLOY_KEY }}
 
       - name: Rebase onto upstream ${{ steps.tags.outputs.new }}
         id: rebase
