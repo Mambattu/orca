@@ -1,0 +1,383 @@
+name: Fork Release
+
+run-name: Fork release ${{ inputs.tag || github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build, e.g. v1.4.265
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  # MARK: Prepare
+  prepare:
+    if: github.repository == 'Mambattu/orca'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      sha: ${{ steps.tag.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Validate tag against package.json
+        id: tag
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            prerelease=true
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            prerelease=false
+          else
+            echo "::error::Unsupported tag shape: $TAG"; exit 1
+          fi
+          version="$(node -p "require('./package.json').version")"
+          if [[ "v$version" != "$TAG" ]]; then
+            echo "::error::package.json version $version does not match tag $TAG"; exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "prerelease=$prerelease"
+            echo "sha=$(git rev-parse HEAD)"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ steps.tag.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft >/tmp/draft 2>/dev/null; then
+            [[ "$(cat /tmp/draft)" == "true" ]] || { echo "::error::$TAG is already published"; exit 1; }
+            echo "Reusing existing draft for $TAG."
+            exit 0
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --prerelease="$PRERELEASE" --title "$TAG" \
+            --notes "Fork build of [stablyai/orca ${TAG}](https://github.com/stablyai/orca/releases/tag/${TAG}) with patches from \`release\`."
+
+  # MARK: Server template
+  orcad-template:
+    needs: prepare
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/qualified-orcad-template.yml
+    with:
+      ref: refs/tags/${{ needs.prepare.outputs.tag }}
+      fast_runners: false
+
+  orca-server-artifact:
+    needs: [prepare, orcad-template]
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/orca-server-artifact.yml
+    with:
+      ref: refs/tags/${{ needs.prepare.outputs.tag }}
+      template_artifact: orcad-template
+
+  # MARK: macOS
+  build-mac:
+    needs: [prepare, orcad-template]
+    runs-on: macos-15
+    timeout-minutes: 150
+    permissions:
+      contents: write
+    env:
+      ORCA_BACKGROUND_LAUNCH: '1'
+      ORCA_REQUIRE_ORCAD_TEMPLATE: '1'
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+
+      - uses: pnpm/setup@v2
+        with:
+          install: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          check-latest: true
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            mobile/pnpm-lock.yaml
+
+      - name: Locate the pinned Node runtime cache
+        run: echo "ORCA_NODE_RUNTIME_CACHE_DIR=$HOME/Library/Caches/orca-node-runtime" >>"$GITHUB_ENV"
+
+      - uses: actions/cache@v5
+        with:
+          path: ~/Library/Caches/orca-node-runtime
+          key: orca-node-runtime-mac-${{ hashFiles('src/shared/node-runtime/node-runtime-pin.ts') }}
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: electron-builder-mac-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: electron-builder-mac-
+
+      - name: Install dependencies
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: pnpm install --frozen-lockfile --cpu=current,x64,arm64
+
+      - uses: ./.github/actions/install-mobile-dependencies
+
+      - name: Verify macOS signing environment
+        run: node config/scripts/desktop-distribution/macos/verify-macos-release-env.mjs
+        env:
+          CSC_LINK: ${{ secrets.MAC_CERTS }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify macOS entitlements
+        run: pnpm verify:macos-entitlements
+
+      # No ORCA_BUILD_IDENTITY / ORCA_POSTHOG_WRITE_KEY: fork builds compile telemetry to null.
+      - name: Build app
+        run: pnpm run build:release
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: orcad-template
+          path: out/orcad-template
+
+      - name: Gate runtime file-watcher process isolation
+        run: |
+          node config/scripts/diagnostics/runtime-watchers/runtime-file-watcher-fault-harness.mjs
+          ELECTRON_RUN_AS_NODE=1 pnpm exec electron config/scripts/diagnostics/runtime-watchers/runtime-file-watcher-fault-harness.mjs
+
+      - name: Package, sign, notarize and upload (macOS)
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 90
+          max_attempts: 2
+          retry_wait_seconds: 30
+          command: >-
+            node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON config/scripts/orcad-distribution/prebuilds/pinned-node-downloads.mjs darwin-arm64 darwin-x64
+            && node config/scripts/native-build/node-addons/ensure-native-runtime.mjs --runtime=electron
+            && ORCA_MAC_RELEASE=1 node config/scripts/desktop-distribution/macos/build-mac-notarization-overlap.mjs --publish always --draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_LINK: ${{ secrets.MAC_CERTS }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Gate the update manifest on the minimum macOS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          node config/scripts/desktop-distribution/macos/gate-mac-update-manifests.mjs dist
+          gh release upload "$TAG" dist/*-mac.yml --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Verify release remains draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node config/scripts/release/publication/assert-github-release-is-draft.mjs "${{ needs.prepare.outputs.tag }}"
+
+  # MARK: Linux
+  build-linux:
+    needs: [prepare, orcad-template]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned below ubuntu-latest: its GCC defaults to x86-64-v3 and ships AVX in node-pty.
+          - os: ubuntu-24.04
+            arch: x64
+            builder_env: ''
+            unpacked_dir: dist/linux-unpacked
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            builder_env: ORCA_LINUX_ARM64_RELEASE=1
+            unpacked_dir: dist/linux-arm64-unpacked
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      ORCA_REQUIRE_ORCAD_TEMPLATE: '1'
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+
+      - uses: pnpm/setup@v2
+        with:
+          install: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          check-latest: true
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            mobile/pnpm-lock.yaml
+
+      - name: Use external node-gyp
+        run: |
+          npm install -g node-gyp@11.5.0
+          echo "npm_config_node_gyp=$(npm root -g)/node-gyp/bin/node-gyp.js" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+          key: electron-builder-linux-${{ matrix.arch }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: electron-builder-linux-${{ matrix.arch }}-
+
+      - name: Install dependencies
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: pnpm install --frozen-lockfile
+
+      - uses: ./.github/actions/install-mobile-dependencies
+
+      - name: Install Linux packaging dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-gi gir1.2-atspi-2.0 at-spi2-core xclip xdotool rpm
+
+      - name: Build app
+        run: pnpm run build:release
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: orcad-template
+          path: out/orcad-template
+
+      - name: Gate runtime file-watcher process isolation
+        run: |
+          node config/scripts/diagnostics/runtime-watchers/runtime-file-watcher-fault-harness.mjs
+          ELECTRON_RUN_AS_NODE=1 pnpm exec electron config/scripts/diagnostics/runtime-watchers/runtime-file-watcher-fault-harness.mjs
+
+      - name: Package and upload (Linux ${{ matrix.arch }})
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: >-
+            node config/scripts/native-build/node-addons/ensure-native-runtime.mjs --runtime=electron
+            && ${{ matrix.builder_env }} pnpm exec electron-builder --config config/electron-builder.config.cjs
+            --linux AppImage deb rpm --${{ matrix.arch }} --publish always -c.publish.releaseType=draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load packaged node-pty on the Linux floor
+        run: node config/scripts/desktop-distribution/runtime-verification/run-linux-packaged-node-pty-floor-smoke.mjs --app-dir ${{ matrix.unpacked_dir }}
+
+  # MARK: Publish
+  publish:
+    needs: [prepare, build-mac, build-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Verify draft, tag and assets
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=50" | jq -e --arg t "$TAG" 'map(select(.tag_name == $t)) | .[0]')"
+          [[ "$(jq -r .draft <<<"$release")" == "true" ]] || { echo "::error::$TAG is no longer a draft"; exit 1; }
+          commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" -q .sha)"
+          [[ "$commit" == "$SHA" ]] || { echo "::error::$TAG moved from $SHA to $commit"; exit 1; }
+          version="${TAG#v}"
+          required=(
+            latest-mac.yml latest-linux.yml latest-linux-arm64.yml
+            orca-macos-arm64.dmg orca-macos-x64.dmg
+            "Orca-${version}-arm64-mac.zip" "Orca-${version}-mac.zip"
+            orca-linux.AppImage orca-linux-arm64.AppImage
+            "orca-ide_${version}_amd64.deb" "orca-ide_${version}_arm64.deb"
+            "orca-ide-${version}.x86_64.rpm" "orca-ide-${version}.aarch64.rpm"
+          )
+          missing=()
+          for name in "${required[@]}"; do
+            jq -e --arg n "$name" '.assets | map(select(.name == $n and .state == "uploaded" and .size > 0)) | length == 1' <<<"$release" >/dev/null || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing assets on $TAG: ${missing[*]}"; exit 1
+          fi
+
+      - name: Publish release
+        env:
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease="$PRERELEASE" --latest="$([[ $PRERELEASE == true ]] && echo false || echo true)"
+
+  publish-orca-server-artifact:
+    needs: [prepare, publish, orca-server-artifact]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.orca-server-artifact.outputs.packed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: orca-server-linux-*
+          path: orca-server
+          merge-multiple: true
+      - name: Write the checksum manifest and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        working-directory: orca-server
+        run: |
+          set -euo pipefail
+          cat orca-server-linux-x64.tar.gz.sha256 orca-server-linux-arm64.tar.gz.sha256 > orca-server-sha256sums.txt
+          sha256sum -c orca-server-sha256sums.txt
+          gh release upload "$TAG" orca-server-linux-x64.tar.gz orca-server-linux-arm64.tar.gz orca-server-sha256sums.txt \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+  # MARK: Homebrew
+  homebrew-bump:
+    needs: [prepare, publish]
+    uses: ./.github/workflows/fork-homebrew-bump.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+    secrets: inherit
