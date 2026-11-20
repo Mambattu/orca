@@ -1,0 +1,86 @@
+name: Fork Homebrew Cask Bump
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to sync, e.g. v1.4.265
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bump-cask:
+    if: github.repository == 'Mambattu/orca'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Resolve cask
+        id: cask
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            token="orca@rc"
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            token="orca"
+          else
+            echo "::error::Unsupported tag shape: $TAG"; exit 1
+          fi
+          echo "path=Casks/${token}.rb" >>"$GITHUB_OUTPUT"
+          echo "title=${token} ${TAG#v}" >>"$GITHUB_OUTPUT"
+
+      - name: Download DMGs and compute sha256
+        id: hash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dmgs \
+            --pattern orca-macos-arm64.dmg --pattern orca-macos-x64.dmg
+          echo "arm=$(sha256sum dmgs/orca-macos-arm64.dmg | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
+          echo "intel=$(sha256sum dmgs/orca-macos-x64.dmg | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          repository: Mambattu/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: Render cask and push
+        working-directory: tap
+        env:
+          CASK_PATH: ${{ steps.cask.outputs.path }}
+          TITLE: ${{ steps.cask.outputs.title }}
+          ARM_SHA: ${{ steps.hash.outputs.arm }}
+          INTEL_SHA: ${{ steps.hash.outputs.intel }}
+        run: |
+          set -euo pipefail
+          [[ -f "$CASK_PATH" ]] || { echo "::error::Missing cask in tap: $CASK_PATH"; exit 1; }
+          python3 - <<'PY'
+          import os, pathlib, re
+          p = pathlib.Path(os.environ["CASK_PATH"])
+          src = p.read_text()
+          src, n1 = re.subn(r'version "[^"]+"', f'version "{os.environ["TAG"][1:]}"', src, count=1)
+          src, n2 = re.subn(
+              r'sha256 arm:\s*"[0-9a-f]+",\s*\n\s*intel:\s*"[0-9a-f]+"',
+              f'sha256 arm:   "{os.environ["ARM_SHA"]}",\n         intel: "{os.environ["INTEL_SHA"]}"',
+              src, count=1)
+          assert n1 == n2 == 1, "cask template no longer matches version/sha256 shape"
+          p.write_text(src)
+          PY
+          if git diff --quiet; then
+            echo "Cask already at $TAG."; exit 0
+          fi
+          git config user.name "Mambattu"
+          git config user.email "mambattu@protonmail.com"
+          git commit -am "$TITLE"
+          git push origin HEAD
