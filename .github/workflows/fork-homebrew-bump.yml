@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: Mambattu/homebrew-tap
-          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+          token: ${{ secrets.TAP_TOKEN }}
           path: tap
 
       - name: Render cask and push
