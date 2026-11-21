@@ -193,14 +193,24 @@ jobs:
             && ORCA_MAC_RELEASE=1 node config/scripts/desktop-distribution/macos/build-mac-notarization-overlap.mjs --publish always --draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Only here: the cert is imported from CSC_LINK in this step. Pins the org identity over
-          # the team's older personal-name Developer ID cert.
-          CSC_NAME: 'Developer ID Application: Mambattu LLC (XTED42S9SG)'
           CSC_LINK: ${{ secrets.MAC_CERTS }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # The team also holds an older Developer ID cert under a personal name; never ship that one.
+      - name: Verify the signing identity
+        run: |
+          set -euo pipefail
+          want='Authority=Developer ID Application: Mambattu LLC (XTED42S9SG)'
+          apps=(dist/mac*/Orca.app)
+          (( ${#apps[@]} )) || { echo "::error::No packaged Orca.app found"; exit 1; }
+          for app in "${apps[@]}"; do
+            got="$(codesign -dv --verbose=2 "$app" 2>&1 | grep -m1 '^Authority=')"
+            echo "$app: $got"
+            [[ "$got" == "$want" ]] || { echo "::error::$app is signed by '$got'"; exit 1; }
+          done
 
       - name: Gate the update manifest on the minimum macOS
         env:
