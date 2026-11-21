@@ -110,8 +110,6 @@ jobs:
       ORCA_REQUIRE_ORCAD_TEMPLATE: '1'
       ORCA_TERMINAL_HOST_BOOT_TIMEOUT_MS: '180000'
       ORCA_MAC_TEAM_ID: XTED42S9SG
-      # Pin the org identity; the team also holds an older Developer ID cert under a personal name.
-      CSC_NAME: 'Developer ID Application: Mambattu LLC (XTED42S9SG)'
       NODE_OPTIONS: --max-old-space-size=6144
     steps:
       - uses: actions/checkout@v6
@@ -195,6 +193,9 @@ jobs:
             && ORCA_MAC_RELEASE=1 node config/scripts/desktop-distribution/macos/build-mac-notarization-overlap.mjs --publish always --draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only here: the cert is imported from CSC_LINK in this step. Pins the org identity over
+          # the team's older personal-name Developer ID cert.
+          CSC_NAME: 'Developer ID Application: Mambattu LLC (XTED42S9SG)'
           CSC_LINK: ${{ secrets.MAC_CERTS }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
